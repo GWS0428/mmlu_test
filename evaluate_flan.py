@@ -4,8 +4,13 @@ import torch
 import numpy as np
 import pandas as pd
 from categories import subcategories, categories
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, AutoModelForCausalLM
 import time
+
+from TEAL_.teal.model import LlamaSparseForCausalLM, LlamaSparseConfig
+from TEAL_.teal.model import MistralSparseForCausalLM, MistralSparseConfig
+from TEAL_.teal.ppl_test_kv import get_model_for_eval
+
 
 choices = ["A", "B", "C", "D"]
 
@@ -54,6 +59,7 @@ def eval(args, subject, model, tokenizer, dev_df, test_df):
         prompt = train_prompt + prompt_end
 
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids.cuda()
+        input_ids = tokenizer("", return_tensors="pt").input_ids.cuda()
 
         while input_ids.shape[-1] > 2048:
             k -= 1
@@ -63,12 +69,20 @@ def eval(args, subject, model, tokenizer, dev_df, test_df):
 
         label = test_df.iloc[i, test_df.shape[1] - 1]
 
-        decoder_input_ids = tokenizer("", return_tensors="pt").input_ids.cuda()
-        decoder_input_ids = model._shift_right(decoder_input_ids)
-        logits = model(
-            input_ids=input_ids, decoder_input_ids=decoder_input_ids
-        ).logits.flatten()
+        # adaptive input for llama model
+        if args.model == "meta-llama/Llama-2-7b-hf":
+            outputs = model(input_ids=input_ids)
+            logits = outputs.logits[0, -1, :] # get the last token
+        elif args.model == "kv_sparsity":
+            outputs = model(input_ids=input_ids)
+            logits = outputs.logits[0, -1, :]
+        else:
+            decoder_input_ids = model._shift_right(input_ids)
+            logits = model(
+                input_ids=input_ids, decoder_input_ids=decoder_input_ids
+            ).logits.flatten()
 
+        # Compute the probabilities for options
         probs = (
             torch.nn.functional.softmax(
                 torch.tensor(
@@ -101,20 +115,36 @@ def eval(args, subject, model, tokenizer, dev_df, test_df):
 
 
 def main(args):
-
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.model)
+    # Load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    heads_per_gpu = len(model.encoder.block) // args.ngpu
-    device_map = {
-        gpu: list(
-            range(
-                0 + (gpu * heads_per_gpu),
-                (0 + (gpu * heads_per_gpu)) + heads_per_gpu,
+    
+    # Load the model
+    if args.model == "meta-llama/Llama-2-7b-hf":
+        model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto")
+    elif args.model == "kv_sparsity":
+        model, tokenizer = get_model_for_eval(args)
+    else:
+        model = AutoModelForSeq2SeqLM.from_pretrained(args.model)
+
+    # Determine the number of layers to allocate per GPU
+    if args.model != "meta-llama/Llama-2-7b-hf":
+        layers = model.encoder.block
+
+        # Create a device map
+        heads_per_gpu = len(layers) // args.ngpu
+        device_map = {
+            gpu: list(
+                range(
+                    0 + (gpu * heads_per_gpu),
+                    (0 + (gpu * heads_per_gpu)) + heads_per_gpu,
+                )
             )
-        )
-        for gpu in range(args.ngpu)
-    }
-    model.parallelize(device_map)
+            for gpu in range(args.ngpu)
+        }
+
+        # Parallelize the model
+        model.parallelize(device_map)
+
     model.eval()
     subjects = sorted(
         [
